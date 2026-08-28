@@ -138,6 +138,9 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
+            if device_capability.major == 8 and device_capability.minor == 9:
+                # PATCH(sm89): FlashInfer sm89.2 sparse MLA build (DSv4 packed)
+                sparse_tail.insert(0, AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120)
             flashinfer_sparse = AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90
             if head_size == 512:
                 sparse_tail.insert(0, flashinfer_sparse)

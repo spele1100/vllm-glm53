@@ -757,10 +757,6 @@ class Glm5NextModel(nn.Module):
 
         for args in weights:
             name, loaded_weight = args[:2]
-            # PATCH(sm89 experiment): skip sparse-indexer tensors when the
-            # indexer module was disabled (index_topk=None via hf_overrides).
-            if ".indexer." in name:
-                continue
             kwargs: dict = args[2] if len(args) > 2 else {}
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -860,13 +856,6 @@ class Glm5NextModel(nn.Module):
                         and name not in params_dict
                         and not self.config.is_linear_attn
                     ):  # noqa: E501
-                        continue
-                    # PATCH(sm89 experiment): when the kpool sparse indexer is
-                    # disabled (index_topk=None via hf_overrides), the module is
-                    # not built, but quantized checkpoints still carry indexer
-                    # tensors (k_norm/wq_b/wk_weights_proj/index_kpool_*).
-                    # Skip them instead of raising KeyError.
-                    if ".indexer." in name and name not in params_dict:
                         continue
                     # Remapping the name of FP8 kv-scale.
                     remapped_name = maybe_remap_kv_scale_name(name, params_dict)

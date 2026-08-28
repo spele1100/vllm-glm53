@@ -43,6 +43,7 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
 )
 from vllm.platforms.interface import DeviceCapability
+from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_sm90_nope_mla
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -120,7 +121,12 @@ class FlashInferMLASparseSM90Backend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 9
+        # PATCH(sm89): FA2 MLA kernel (ckv=512, kpe in {0,64}) runs on Ada via
+        # the FlashInfer 0.6.17+sm89.2 build; rope-0 models use a zero-padded
+        # 64-dim rope (exact, adds no score contribution).
+        return capability.major == 9 or (
+            capability.major == 8 and capability.minor == 9
+        )
 
     @classmethod
     def supports_combination(
@@ -201,7 +207,13 @@ class _SM90State:
         self.topk_width = topk_width
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
+        # PATCH(sm89): the sm89 FA2 kernel NaNs with head_dim_kpe=0; feed a
+        # zero 64-dim rope instead (contributes exactly 0 to every score).
+        self.plan_kpe_dim = qk_rope_head_dim if qk_rope_head_dim > 0 else 64
         self.sm_scale = sm_scale
+        self.zero_q_pe = torch.zeros(
+            max_tokens, 1, self.plan_kpe_dim, dtype=torch.bfloat16, device=device
+        )
         # User-reserved buffers: with use_cuda_graph=True plan() refreshes
         # these in place, so run()'s captured kernels always read them.
         self.kv_indices = torch.zeros(
@@ -217,7 +229,13 @@ class _SM90State:
             kv_indices=self.kv_indices,
             kv_len_arr=self.kv_len_arr,
             use_cuda_graph=True,
-            backend="fa3",
+            # PATCH(sm89): FA3 cubins are Hopper-only; the FA2 MLA kernel
+            # (ckv=512, kpe in {0,64}) runs on Ada via the sm89.2 build.
+            backend=(
+                "fa2"
+                if current_platform.get_device_capability().major == 8
+                else "fa3"
+            ),
         )
         self._arange_cpu = torch.arange(self.max_tokens + 1, dtype=torch.int32)
         self._qo_cpu = torch.empty(self.max_tokens + 1, dtype=torch.int32)
@@ -265,7 +283,7 @@ class _SM90State:
             self._lens_cpu,
             self.num_heads,
             self.kv_lora_rank,  # head_dim_ckv
-            self.qk_rope_head_dim,  # 0 (NoPE) or 64 (rope MLA)
+            self.plan_kpe_dim,  # 0 (NoPE) or 64 (rope MLA); sm89 pads 0->64
             1,  # page_size: top-k slots are the page table
             False,  # causal: encoded by the indexer's selection
             self.sm_scale,
@@ -275,6 +293,7 @@ class _SM90State:
 
 
 _SM90_STATE: _SM90State | None = None
+_SM89_ZERO_KPE: torch.Tensor | None = None
 
 
 def _get_sm90_state() -> "_SM90State | None":
@@ -455,7 +474,16 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseMetadat
         num_tokens = q_rope.shape[0]
         # NoPE models hand a zero-width rope tensor through; rope MLA hands
         # the real 64-dim part. The kernel takes both as-is.
-        q_pe = q_rope.reshape(num_tokens, self.num_heads, self.qk_rope_head_dim)
+        state = _SM90_STATE
+        assert state is not None
+        if self.qk_rope_head_dim == 0:
+            # PATCH(sm89): zero-pad rope on sm89 (kernel requires kpe=64)
+            zp = state.zero_q_pe[:num_tokens]
+            q_pe = zp.expand(num_tokens, self.num_heads, state.plan_kpe_dim)
+        else:
+            q_pe = q_rope.reshape(
+                num_tokens, self.num_heads, self.qk_rope_head_dim
+            )
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_tokens]
@@ -470,8 +498,6 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseMetadat
             NUM_TOPK_TOKENS=topk_indices.shape[1],
             return_valid_counts=True,
         )
-        state = _SM90_STATE
-        assert state is not None
         # Refresh top-k rows in graph and clamp masked tails to a valid slot;
         # per-row lengths are already baked into the host-side plan.
         width = topk_slots.shape[1]
@@ -485,7 +511,22 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseMetadat
             else kv_c_and_k_pe_cache
         ).reshape(-1, 1, self.head_size)
         ckv = flat[..., : self.kv_lora_rank]
-        kpe = flat[..., self.kv_lora_rank :]
+        if self.qk_rope_head_dim == 0:
+            # PATCH(sm89): shared all-zero kpe pool (per-layer content is
+            # identical zeros, so one buffer serves every layer)
+            global _SM89_ZERO_KPE
+            num_slots = ckv.shape[0]
+            if _SM89_ZERO_KPE is None or _SM89_ZERO_KPE.shape[0] < num_slots:
+                _SM89_ZERO_KPE = torch.zeros(
+                    num_slots,
+                    1,
+                    state.plan_kpe_dim,
+                    dtype=ckv.dtype,
+                    device=ckv.device,
+                )
+            kpe = _SM89_ZERO_KPE[:num_slots]
+        else:
+            kpe = flat[..., self.kv_lora_rank :]
 
         scale_kwargs = (
             {"ckv_scale": float(layer._k_scale_float or 1.0), "kpe_scale": 1.0}

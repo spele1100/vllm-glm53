@@ -309,10 +309,13 @@ def has_flashinfer_sm90_nope_mla() -> bool:
         params = inspect.signature(BatchMLAPagedAttentionWrapper.run).parameters
     except (TypeError, ValueError):
         return False
-    return (
-        "ckv_scale_arr" in params
-        and params["ckv_scale_arr"].kind is inspect.Parameter.KEYWORD_ONLY
-    )
+    if "ckv_scale_arr" in params and params["ckv_scale_arr"].kind is (
+        inspect.Parameter.KEYWORD_ONLY
+    ):
+        return True
+    # PATCH(sm89): the 0.6.17+sm89.2 build exposes scalar ckv_scale/kpe_scale
+    # instead of ckv_scale_arr; the FA2 kernel supports ckv=512 on sm89.
+    return "ckv_scale" in params and "kpe_scale" in params
 
 
 @functools.cache
@@ -349,6 +352,20 @@ def has_flashinfer_sparse_mla_sm120_config(num_q_heads: int, top_k: int) -> bool
     mod = _get_submodule("flashinfer.mla._sparse_mla_sm120")
     dispatch = getattr(mod, "_DECODE_DSV4_DISPATCH", None) if mod else None
     return dispatch is not None and (int(num_q_heads), int(top_k)) in dispatch
+
+
+@functools.cache
+def has_flashinfer_sparse_mla_sm89() -> bool:
+    """Return whether the installed FlashInfer enables sparse MLA on SM89."""
+    if not has_flashinfer_sparse_mla_sm120():
+        return False
+    try:
+        from flashinfer.mla._core import _resolve_dsv4_sparse_mla_backend
+
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        return _resolve_dsv4_sparse_mla_backend(device) == "sparse"
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 @functools.cache

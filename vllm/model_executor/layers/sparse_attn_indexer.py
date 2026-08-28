@@ -21,7 +21,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
-    has_deep_gemm,
+    has_deep_gemm, is_mqa_backend_available,
 )
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import (
@@ -773,10 +773,10 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if current_platform.is_cuda() and not is_mqa_backend_available():
             raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+                "Sparse Attention Indexer CUDA op requires DeepGEMM or an "
+                "SM89/SM12x fallback in the current vLLM environment."
             )
 
     def forward_native(

@@ -172,7 +172,9 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 12
+        return capability.major == 12 or (
+            capability.major == 8 and capability.minor == 9
+        )
 
     @classmethod
     def supports_combination(
@@ -188,9 +190,18 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
         device_capability: DeviceCapability,
     ) -> str | None:
         from vllm.config import get_current_vllm_config
-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+        from vllm.utils.flashinfer import (
+            has_flashinfer_sparse_mla_sm89,
+            has_flashinfer_sparse_mla_sm120,
+        )
 
-        if not has_flashinfer_sparse_mla_sm120():
+        is_sm89 = (device_capability.major, device_capability.minor) == (8, 9)
+        has_sparse_mla = (
+            has_flashinfer_sparse_mla_sm89()
+            if is_sm89
+            else has_flashinfer_sparse_mla_sm120()
+        )
+        if not has_sparse_mla:
             return (
                 "FLASHINFER_MLA_SPARSE_SM120 requires FlashInfer's "
                 "sparse MLA decode API"
@@ -218,6 +229,13 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
                 return (
                     "FLASHINFER_MLA_SPARSE_SM120 requires index_topk=2048; "
                     f"got {index_topk}"
+                )
+            # PATCH(sm89): the fp8_ds_mla packed layout is 512 NoPE + 64 RoPE;
+            # models with qk_rope_head_dim=0 (GLM-5.3 NoPE MLA) cannot use it.
+            if getattr(hf_text_config, "qk_rope_head_dim", 64) != 64:
+                return (
+                    "FLASHINFER_MLA_SPARSE_SM120 requires qk_rope_head_dim=64 "
+                    "(fp8_ds_mla packed layout)"
                 )
         return None
 

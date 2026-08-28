@@ -512,6 +512,19 @@ def transform_sf_into_required_layout(*args, **kwargs):
     )
 
 
+
+def _use_sm12x_mqa_fallback() -> bool:
+    """Use portable MQA/HC kernels where DeepGEMM is unsupported (sm89/sm120)."""
+    return current_platform.is_device_capability_family(120) or (
+        current_platform.is_cuda() and current_platform.is_device_capability((8, 9))
+    )
+
+
+def is_mqa_backend_available() -> bool:
+    """Whether MQA kernels are available through DeepGEMM or a fallback."""
+    return has_deep_gemm() or _use_sm12x_mqa_fallback()
+
+
 def fp8_fp4_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -544,6 +557,12 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
+    if q[1] is None and _use_sm12x_mqa_fallback():
+        from vllm.models.glm5next.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+        return sm12x_deep_gemm_fallbacks._fp8_mqa_logits_sm12x(
+            q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
+        )
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
@@ -650,6 +669,12 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    if _use_sm12x_mqa_fallback() and q[1] is None:
+        from vllm.models.glm5next.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+        return sm12x_deep_gemm_fallbacks._fp8_paged_mqa_logits_sm12x(
+            q, kv_cache, weights, context_lens, block_tables, max_model_len
+        )
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()
@@ -688,6 +713,12 @@ def tf32_hc_prenorm_gemm(
 
     See the caller function for shape requirement
     """
+    if _use_sm12x_mqa_fallback():
+        from vllm.models.glm5next.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+        return sm12x_deep_gemm_fallbacks._tf32_hc_prenorm_gemm_sm12x(
+            x, fn, out, sqrsum, num_split
+        )
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
         return _missing()
