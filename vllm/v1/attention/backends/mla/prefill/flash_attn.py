@@ -327,6 +327,13 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
                 qk_rope_head_dim=64,
                 v_head_dim=128,
             ),
+            # GLM-5.3 nope-only MLA: qk_rope=0, equal qk/v head dims (256).
+            # FA2 supports head_size 256 on sm89 and no V padding is needed.
+            MLADimensions(
+                qk_nope_head_dim=256,
+                qk_rope_head_dim=0,
+                v_head_dim=256,
+            ),
         ]
 
     def __init__(
