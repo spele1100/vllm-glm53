@@ -447,14 +447,30 @@ class Glm5NextDecoderLayer(nn.Module):
             if self.layer_idx == 0:
                 x = hc_expand(x, self.n)
             residual = x
+            if self.layer_idx == 0 and 3 <= x.shape[0] <= 31 and not torch.cuda.is_current_stream_capturing():
+                import os as _os
+                if _os.path.exists("/home/bot/llm/probe/DUMP_ON"):
+                    _d = "/home/bot/llm/probe/kda_dump"
+                    _seq = getattr(Glm5NextDecoderLayer, "_dbg_seq", 0)
+                    Glm5NextDecoderLayer._dbg_seq = _seq + 1
+                    torch.save(x.float().cpu(), f"{_d}/lyr0_streams_in_{_seq}.pt")
+                    torch.save(residual.float().cpu(), f"{_d}/lyr0_residual_{_seq}.pt")
             post, comb, x = self.hc_pre(
                 x,
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
-                norm_weight=self.input_layernorm.weight.data,
-                norm_eps=self.input_layernorm.variance_epsilon,
+                norm_weight=None,
+                norm_eps=0.0,
             )
+            # PATCH(sm89-correctness): the fused-norm tilelang kernel
+            # normalizes layer_input with the flat-stream statistic
+            # rsqrt(mean(x_flat^2)+eps), but reference semantics normalize
+            # the COLLAPSED vector rsqrt(mean(collapsed^2)+eps). With GLM
+            # tiny pre-norm activations (var ~1e-5) and eps 1e-5 this
+            # shrinks layer_input per-token => gibberish. Apply the exact
+            # RMSNorm here instead.
+            x = self.input_layernorm(x)
         else:
             residual, post, comb, x = self.hc_fused_post_pre(
                 x,
@@ -464,15 +480,44 @@ class Glm5NextDecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
-                norm_weight=self.input_layernorm.weight.data,
-                norm_eps=self.input_layernorm.variance_epsilon,
+                norm_weight=None,
+                norm_eps=0.0,
             )
+            x = self.input_layernorm(x)  # PATCH(sm89-correctness): see above
 
         # Attention needs the full token sequence; mHC above ran on the SP
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if self.is_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
+        if self.layer_idx == 0 and 3 <= x.shape[0] <= 31 and not torch.cuda.is_current_stream_capturing():
+            import os as _os
+            if _os.path.exists("/home/bot/llm/probe/DUMP_ON"):
+                _seq = getattr(Glm5NextDecoderLayer, "_dbg_seq", 1) - 1
+                torch.save(x.float().cpu(), f"/home/bot/llm/probe/kda_dump/lyr0_pre_attn_x_{_seq}.pt")
+                if _seq == 2 or not hasattr(self, "_w_dumped"):
+                    self._w_dumped = True
+                    _d = "/home/bot/llm/probe/kda_dump"
+                    torch.save(self.hc_attn_fn.float().cpu(), f"{_d}/mdl_fn.pt")
+                    torch.save(self.hc_attn_base.float().cpu(), f"{_d}/mdl_base.pt")
+                    torch.save(self.hc_attn_scale.float().cpu(), f"{_d}/mdl_scale.pt")
+                    torch.save(self.input_layernorm.weight.data.float().cpu(), f"{_d}/mdl_normw.pt")
+                    from vllm.model_executor.layers.mhc import _apply_mhc_norm
+
+                    _p, _c, _x = self.mhc_pre_op.forward_native(
+                        residual,
+                        self.hc_attn_fn,
+                        self.hc_attn_scale,
+                        self.hc_attn_base,
+                        rms_eps=self.rms_norm_eps,
+                        hc_pre_eps=self.hc_eps,
+                        hc_sinkhorn_eps=self.hc_eps,
+                        hc_post_mult_value=self.mhc_post_mult_value,
+                        sinkhorn_repeat=self.mhc_sinkhorn_iterations,
+                    )
+                    _x = _apply_mhc_norm(_x, self.input_layernorm.weight.data, self.input_layernorm.variance_epsilon)
+                    torch.save(_x.float().cpu(), f"{_d}/lyr0_native_x.pt")
+                    torch.save(x.float().cpu(), f"{_d}/lyr0_tile_x.pt")
         x = self.self_attn(
             hidden_states=x,
             positions=positions,
@@ -490,9 +535,10 @@ class Glm5NextDecoderLayer(nn.Module):
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            norm_weight=self.post_attention_layernorm.weight.data,
-            norm_eps=self.post_attention_layernorm.variance_epsilon,
+            norm_weight=None,
+            norm_eps=0.0,
         )
+        x = self.post_attention_layernorm(x)  # PATCH(sm89-correctness): see above
 
         # Fully Connected
         if self._mlp_is_moe:
@@ -692,10 +738,45 @@ class Glm5NextModel(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
-        for layer in self._active_layers:
+        import os as _os
+        _flag = "/home/bot/llm/probe/DUMP_ON"
+        _dump_dir = "/home/bot/llm/probe/vllm_dump" if _os.path.exists(_flag) else None
+        import torch as _torch
+
+        _dump_on = (
+            _dump_dir
+            and get_tensor_model_parallel_rank() == 0
+            and not _torch.cuda.is_current_stream_capturing()
+            and 3 <= positions.shape[0] <= 31
+            and getattr(Glm5NextModel, "_glm53_dump_seq", 0)
+            < 12
+        )
+        if _dump_on and input_ids is not None and not bool(
+            input_ids.abs().sum().item()
+        ):
+            _dump_on = False
+        if _dump_on:
+            _seq = getattr(Glm5NextModel, "_glm53_dump_seq", 0)
+            Glm5NextModel._glm53_dump_seq = _seq + 1
+            _sub = f"{_dump_dir}/vllm_seq{_seq}"
+            _os.makedirs(_sub, exist_ok=True)
+            _torch.save(
+                {
+                    "input_ids": input_ids.cpu() if input_ids is not None else None,
+                    "positions": positions.cpu(),
+                },
+                f"{_sub}/meta.pt",
+            )
+        for _li, layer in enumerate(self._active_layers):
             hidden_states, residual, post, comb = layer(
                 positions, hidden_states, residual, post, comb
             )
+            if _dump_on:
+                _torch.save(hidden_states.float().cpu(), f"{_sub}/x_{_li:02d}.pt")
+                if residual is not None:
+                    _torch.save(
+                        residual.float().cpu(), f"{_sub}/r_{_li:02d}.pt"
+                    )
 
         if not get_pp_group().is_last_rank:
             # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
