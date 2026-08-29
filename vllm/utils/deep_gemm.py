@@ -525,6 +525,73 @@ def is_mqa_backend_available() -> bool:
     return has_deep_gemm() or _use_sm12x_mqa_fallback()
 
 
+def use_portable_mqa_fallback() -> bool:
+    """Whether MQA kernels run through the SM89/SM12x portable Triton path.
+
+    True exactly when DeepGEMM is absent but the fallback is active (Ada /
+    SM12x class GPUs). The portable path materializes dense fp32 logits
+    (see ``paged_mqa_topk_indices_no_logits`` / prefill tiling) and needs
+    the bounded-memory variants to survive long contexts on 48 GB cards.
+    """
+    return _use_sm12x_mqa_fallback()
+
+
+# Bounded-memory budget (elements, fp32) for one dense logits slab.
+_PORTABLE_MQA_LOGITS_SLAB_ELEMS = 32 * 1024 * 1024  # 128 MiB fp32
+
+
+def portable_mqa_logits_slab_elems() -> int:
+    return _PORTABLE_MQA_LOGITS_SLAB_ELEMS
+
+
+def prefill_logits_tile_rows(num_rows: int, context_len: int) -> int:
+    """Query-row tile size bounding one dense prefill logits slab.
+
+    The portable prefill MQA fallback allocates ``[rows, context]`` fp32
+    logits; at long contexts (4096-token chunk x 130K-pool context) that
+    transient exceeds a 48 GB card's headroom once CUDA-graph pools are
+    reserved, and the resulting mid-step allocation failure surfaces as an
+    illegal memory access. Tiling the query rows bounds the slab; top-k is
+    per query row, so tiling is exact.
+    """
+    if context_len <= 0:
+        return max(num_rows, 1)
+    return max(1, min(num_rows, _PORTABLE_MQA_LOGITS_SLAB_ELEMS // context_len))
+
+
+def paged_mqa_topk_indices_no_logits(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+    topk_indices: torch.Tensor,
+) -> bool:
+    """Streaming paged-MQA top-k without materializing dense logits.
+
+    Returns True when handled by the SM89/SM12x portable fallback, where the
+    dense decode path would allocate ``[rows, max_model_len]`` fp32 logits
+    (2 MiB per row at max_model_len=524288 — 318 MiB for a 152-row batch,
+    which is exactly the allocation that starved the allocator and produced
+    the long-context illegal-memory-access crashes). The caller falls back
+    to its normal dense path when this returns False.
+    """
+    if _use_sm12x_mqa_fallback() and q[1] is None:
+        from vllm.models.glm5next.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+        return sm12x_deep_gemm_fallbacks.fp8_fp4_paged_mqa_topk_indices(
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+            topk_indices,
+        )
+    return False
+
+
 def fp8_fp4_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],

@@ -456,6 +456,7 @@ def fp8_paged_mqa_logits_rowwise_triton(
     max_model_len: int,
     token_start: int = 0,
     token_count: int | None = None,
+    logits_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Rowwise paged-MQA logits wrapper.
 
@@ -475,11 +476,16 @@ def fp8_paged_mqa_logits_rowwise_triton(
     assert token_start >= 0
     assert token_count >= 0
     assert token_start + token_count <= max_model_len
-    logits = torch.empty(
-        (num_rows, token_count),
-        device=q.device,
-        dtype=torch.float32,
-    )
+    if logits_out is not None:
+        assert logits_out.shape == (num_rows, token_count)
+        assert logits_out.dtype == torch.float32 and logits_out.device == q.device
+        logits = logits_out
+    else:
+        logits = torch.empty(
+            (num_rows, token_count),
+            device=q.device,
+            dtype=torch.float32,
+        )
     if num_rows == 0 or token_count == 0:
         return logits
 
@@ -537,6 +543,7 @@ def fp8_paged_mqa_logits_triton(
     max_model_len: int,
     token_start: int = 0,
     token_count: int | None = None,
+    logits_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size, next_n, num_heads, head_dim = q.size()
     # Aligned head shapes (DSv4-Flash and any future MQA model with
@@ -555,6 +562,7 @@ def fp8_paged_mqa_logits_triton(
             max_model_len,
             token_start=token_start,
             token_count=token_count,
+            logits_out=logits_out,
         )
 
     kv_values, kv_scale = _view_packed_fp8_paged_mqa_kv_cache(kv_cache, head_dim)
@@ -565,11 +573,16 @@ def fp8_paged_mqa_logits_triton(
     assert token_start >= 0
     assert token_count >= 0
     assert token_start + token_count <= max_model_len
-    logits = torch.empty(
-        (num_rows, token_count),
-        device=q.device,
-        dtype=torch.float32,
-    )
+    if logits_out is not None:
+        assert logits_out.shape == (num_rows, token_count)
+        assert logits_out.dtype == torch.float32 and logits_out.device == q.device
+        logits = logits_out
+    else:
+        logits = torch.empty(
+            (num_rows, token_count),
+            device=q.device,
+            dtype=torch.float32,
+        )
     if num_rows == 0 or token_count == 0:
         return logits
 

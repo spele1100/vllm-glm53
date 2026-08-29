@@ -434,7 +434,13 @@ def _fp8_mqa_logits_sm12x(
     clean_logits: bool,
 ) -> torch.Tensor:
     q_values, q_scale = q
-    if clean_logits and q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
+    # PATCH(sm89-longctx): the Triton kernel already writes -inf outside
+    # [cu_seqlen_ks, cu_seqlen_ke), which every clean_logits=False caller
+    # tolerates (top-k bounds by the same ranges). Gating on clean_logits
+    # forced prefill onto the dense pure-torch reference path, which
+    # materializes full [rows, context] fp32 logits and is the long-context
+    # transient-memory blow-up.
+    if q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
         from vllm.models.glm5next.nvidia.ops.sm12x_mqa import (
             fp8_mqa_logits_triton,
         )
@@ -587,7 +593,22 @@ def fp8_fp4_paged_mqa_topk_indices(
         device=q_values.device,
         dtype=torch.float32,
     )
-    chunk_size = max(1, _SM120_PAGED_MQA_TOPK_CHUNK_SIZE)
+    # PATCH(sm89-longctx): adaptive KV-chunk width. The dense fallback
+    # allocates [num_rows, max_model_len] fp32 logits (2 MiB per row at
+    # max_model_len=524288); a 152-row decode batch needs 318 MiB of
+    # transient headroom per layer, which is exactly the allocation that
+    # starved the allocator under CUDA-graph memory pools and surfaced as
+    # illegal-memory-access crashes during long-context chunked prefill.
+    # Chunk the KV dimension so one logits slab stays within a fixed budget:
+    # small batches keep a single full-width pass (identical to dense),
+    # large batches iterate a few bounded slabs.
+    from vllm.utils.deep_gemm import portable_mqa_logits_slab_elems
+
+    _slab = portable_mqa_logits_slab_elems()
+    chunk_size = max(
+        max(1, _SM120_PAGED_MQA_TOPK_CHUNK_SIZE),
+        min(max_model_len, _slab // max(num_rows, 1)),
+    )
     max_chunk_topk = min(topk_tokens, chunk_size)
     chunk_values_buf = torch.empty(
         (num_rows, max_chunk_topk),
@@ -625,6 +646,16 @@ def fp8_fp4_paged_mqa_topk_indices(
         fp8_paged_mqa_logits_triton,
     )
 
+    # PATCH(sm89-longctx): one reusable chunk-logits buffer across the loop
+    # (and across CUDA-graph capture), instead of a fresh allocation per
+    # iteration; each torch.empty inside a captured loop is carved
+    # permanently out of the graph pool.
+    _max_chunk_tokens = min(chunk_size, max_model_len)
+    chunk_logits_buf = torch.empty(
+        (num_rows, _max_chunk_tokens),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
     for token_start in range(0, max_model_len, chunk_size):
         token_count = min(chunk_size, max_model_len - token_start)
         chunk_logits = fp8_paged_mqa_logits_triton(
@@ -636,6 +667,7 @@ def fp8_fp4_paged_mqa_topk_indices(
             max_model_len,
             token_start=token_start,
             token_count=token_count,
+            logits_out=chunk_logits_buf[:, :token_count],
         )
         chunk_topk = min(topk_tokens, token_count)
         chunk_values = chunk_values_buf[:, :chunk_topk]

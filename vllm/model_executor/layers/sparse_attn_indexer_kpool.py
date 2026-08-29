@@ -522,6 +522,7 @@ def sparse_attn_indexer_kpool(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+            _tile_prefill = False
             if current_platform.is_rocm():
                 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
                     rocm_fp8_mqa_logits,
@@ -536,17 +537,26 @@ def sparse_attn_indexer_kpool(
                     chunk.cu_seqlen_ke,
                 )
             else:
-                from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
-
-                logits = fp8_fp4_mqa_logits(
-                    (q_slice_cast, q_scale_slice),
-                    (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    clean_logits=False,
+                from vllm.utils.deep_gemm import (
+                    fp8_fp4_mqa_logits,
+                    prefill_logits_tile_rows,
+                    use_portable_mqa_fallback,
                 )
-            num_rows = logits.shape[0]
+
+                _tile_prefill = (
+                    q_scale_slice is None and use_portable_mqa_fallback()
+                )
+                logits = None
+                if not _tile_prefill:
+                    logits = fp8_fp4_mqa_logits(
+                        (q_slice_cast, q_scale_slice),
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        clean_logits=False,
+                    )
+            num_rows = q_slice_cast.shape[0]
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
             # so topk selects pools. We pick topk_tokens // kpool pools then
@@ -554,7 +564,9 @@ def sparse_attn_indexer_kpool(
             select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
             if index_kpool > 1:
                 pool_topk = torch.empty(
-                    (num_rows, select_k), dtype=torch.int32, device=logits.device
+                    (num_rows, select_k),
+                    dtype=torch.int32,
+                    device=q_slice_cast.device,
                 )
                 topk_dst = pool_topk
             else:
@@ -562,7 +574,38 @@ def sparse_attn_indexer_kpool(
                     chunk.token_start : chunk.token_end, :topk_tokens
                 ]
 
-            if current_platform.is_xpu():
+            if _tile_prefill:
+                # PATCH(sm89-longctx): the portable fallback materializes
+                # dense [rows, context] fp32 logits; tile the query rows so
+                # each slab stays bounded. Top-k is per query row, so tiling
+                # is exact. Fixes long-context prefill OOM -> illegal memory
+                # access on 48 GB Ada cards.
+                from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+
+                tile = prefill_logits_tile_rows(
+                    num_rows, chunk.total_seq_lens
+                )
+                for r0 in range(0, num_rows, tile):
+                    r1 = min(r0 + tile, num_rows)
+                    logits_tile = fp8_fp4_mqa_logits(
+                        (q_slice_cast[r0:r1], None),
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start + r0 : chunk.token_start + r1],
+                        chunk.cu_seqlen_ks[r0:r1],
+                        chunk.cu_seqlen_ke[r0:r1],
+                        clean_logits=False,
+                    )
+                    torch.ops._C.top_k_per_row_prefill(
+                        logits_tile,
+                        chunk.cu_seqlen_ks[r0:r1],
+                        chunk.cu_seqlen_ke[r0:r1],
+                        topk_dst[r0:r1],
+                        r1 - r0,
+                        logits_tile.stride(0),
+                        logits_tile.stride(1),
+                        select_k,
+                    )
+            elif current_platform.is_xpu():
                 xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
                     logits,
                     chunk.cu_seqlen_ks,
@@ -783,6 +826,7 @@ def sparse_attn_indexer_kpool(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
+        _streamed = False
         if current_platform.is_rocm():
             from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
                 rocm_fp8_paged_mqa_logits,
@@ -799,31 +843,72 @@ def sparse_attn_indexer_kpool(
                 max_model_len=max_model_len,
             )
         else:
-            from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+            from vllm.utils.deep_gemm import (
+                fp8_fp4_paged_mqa_logits,
+                paged_mqa_topk_indices_no_logits,
+            )
 
-            logits = fp8_fp4_paged_mqa_logits(
+            # PATCH(sm89-longctx): on the portable fallback, compute the
+            # decode top-k by streaming KV chunks instead of materializing
+            # the dense [rows, max_model_len] fp32 logits (2 MiB/row at
+            # 512K len; 152 rows = 318 MiB transient per layer, which
+            # starved the allocator under CUDA-graph pools and crashed
+            # long-context serving with illegal memory accesses).
+            _select_k_d = (
+                topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+            )
+            if index_kpool > 1:
+                pool_topk = torch.empty(
+                    (num_padded_tokens, _select_k_d),
+                    dtype=torch.int32,
+                    device=padded_q_quant_cast.device,
+                )
+                topk_dst = pool_topk
+            else:
+                topk_dst = topk_indices_buffer[
+                    :num_padded_tokens, :topk_tokens
+                ]
+            logits = None
+            _streamed = paged_mqa_topk_indices_no_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
                 padded_weights[:num_padded_tokens],
                 seq_lens,
                 decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                clean_logits=False,
+                max_model_len,
+                topk_dst,
             )
-        num_rows = logits.shape[0]
+            if not _streamed:
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    padded_weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    clean_logits=False,
+                )
+        num_rows = (
+            logits.shape[0] if logits is not None else num_padded_tokens
+        )
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
         select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
-        if index_kpool > 1:
-            pool_topk = torch.empty(
-                (num_rows, select_k), dtype=torch.int32, device=logits.device
-            )
-            topk_dst = pool_topk
-        else:
-            topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        if not _streamed:
+            if index_kpool > 1:
+                pool_topk = torch.empty(
+                    (num_rows, select_k),
+                    dtype=torch.int32,
+                    device=logits.device,
+                )
+                topk_dst = pool_topk
+            else:
+                topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and select_k in (512, 1024, 2048):
+        if _streamed:
+            pass  # top-k already written by the streaming fallback
+        elif current_platform.is_cuda() and select_k in (512, 1024, 2048):
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
